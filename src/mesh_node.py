@@ -1,52 +1,150 @@
-import os
-import cryptography
-from cryptography.hazmat.primitives.asymmetric import rsa
-from cryptography.hazmat.primitives import hashes
-from cryptography.hazmat.primitives.kdf.hkdf import HKDF
-from cryptography.hazmat.backends import default_backend
+import asyncio
+import json
+from typing import Dict, Set, Optional
+from dataclasses import dataclass
+from datetime import datetime
+import socket
+import random
+
+@dataclass
+class NodeInfo:
+    node_id: str
+    last_seen: datetime
+    address: str
+    port: int
+    status: str
 
 class MeshNode:
-    def __init__(self, node_id):
-        self.node_id = node_id
-        self.private_key = rsa.generate_private_key(
-            public_exponent=65537,
-            key_size=2048,
-            backend=default_backend()
+    def __init__(self, port: int = 5000):
+        self.node_id = hex(random.getrandbits(128))[2:]
+        self.port = port
+        self.peers: Dict[str, NodeInfo] = {}
+        self.active = False
+        self._heartbeat_interval = 30
+    
+    async def start(self):
+        self.active = True
+        self.server = await asyncio.start_server(
+            self._handle_connection, '0.0.0.0', self.port
         )
-        self.public_key = self.private_key.public_key()
-        self.shared_keys = {}
+        await asyncio.gather(
+            self._discovery_broadcast(),
+            self._maintain_mesh(),
+            self._prune_dead_nodes()
+        )
 
-    def establish_secure_connection(self, peer_node):
-        if peer_node.node_id in self.shared_keys:
-            return self.shared_keys[peer_node.node_id]
+    async def stop(self):
+        self.active = False
+        if hasattr(self, 'server'):
+            self.server.close()
+            await self.server.wait_closed()
 
-        # Generate shared secret using Diffie-Hellman key exchange
-        shared_secret = self.private_key.exchange(cryptography.hazmat.primitives.asymmetric.dh.DHParameterNumbers(
-            p=int(os.urandom(256).hex(), 16),
-            g=2
-        ).create_dh_parameters(backend=default_backend()).parameter_numbers(), peer_node.public_key)
+    async def _handle_connection(self, reader, writer):
+        data = await reader.read(4096)
+        message = json.loads(data.decode())
+        
+        if message['type'] == 'discovery':
+            await self._handle_discovery(message, writer)
+        elif message['type'] == 'heartbeat':
+            await self._handle_heartbeat(message)
 
-        # Derive shared encryption key using HKDF
-        shared_key = HKDF(
-            algorithm=hashes.SHA256(),
-            length=32,
-            salt=None,
-            info=b'mesh_node_shared_key',
-            backend=default_backend()
-        ).derive(shared_secret)
+        writer.close()
+        await writer.wait_closed()
 
-        self.shared_keys[peer_node.node_id] = shared_key
-        peer_node.shared_keys[self.node_id] = shared_key
-        return shared_key
+    async def _handle_discovery(self, message: dict, writer):
+        peer_info = NodeInfo(
+            node_id=message['node_id'],
+            last_seen=datetime.now(),
+            address=message['address'],
+            port=message['port'],
+            status='active'
+        )
+        self.peers[peer_info.node_id] = peer_info
+        
+        # Send back our peer list
+        response = {
+            'type': 'discovery_response',
+            'peers': [
+                {
+                    'node_id': p.node_id,
+                    'address': p.address,
+                    'port': p.port
+                } for p in self.peers.values()
+            ]
+        }
+        writer.write(json.dumps(response).encode())
+        await writer.drain()
 
-    def encrypt_message(self, peer_node, message):
-        shared_key = self.establish_secure_connection(peer_node)
-        # Encrypt message using shared key and appropriate cryptographic primitives
-        encrypted_message = ...
-        return encrypted_message
+    async def _handle_heartbeat(self, message: dict):
+        if message['node_id'] in self.peers:
+            self.peers[message['node_id']].last_seen = datetime.now()
+            self.peers[message['node_id']].status = 'active'
 
-    def decrypt_message(self, peer_node, encrypted_message):
-        shared_key = self.establish_secure_connection(peer_node)
-        # Decrypt message using shared key and appropriate cryptographic primitives
-        message = ...
-        return message
+    async def _discovery_broadcast(self):
+        while self.active:
+            message = {
+                'type': 'discovery',
+                'node_id': self.node_id,
+                'address': socket.gethostbyname(socket.gethostname()),
+                'port': self.port
+            }
+            
+            # Broadcast to known peers
+            for peer in list(self.peers.values()):
+                try:
+                    reader, writer = await asyncio.open_connection(
+                        peer.address, peer.port
+                    )
+                    writer.write(json.dumps(message).encode())
+                    await writer.drain()
+                    writer.close()
+                    await writer.wait_closed()
+                except:
+                    peer.status = 'unreachable'
+            
+            await asyncio.sleep(self._heartbeat_interval)
+
+    async def _maintain_mesh(self):
+        while self.active:
+            for peer in list(self.peers.values()):
+                if peer.status == 'unreachable':
+                    try:
+                        # Attempt to reconnect
+                        reader, writer = await asyncio.open_connection(
+                            peer.address, peer.port
+                        )
+                        peer.status = 'active'
+                        peer.last_seen = datetime.now()
+                        writer.close()
+                        await writer.wait_closed()
+                    except:
+                        pass
+            await asyncio.sleep(self._heartbeat_interval)
+
+    async def _prune_dead_nodes(self):
+        while self.active:
+            now = datetime.now()
+            dead_nodes = [
+                node_id for node_id, info in self.peers.items()
+                if (now - info.last_seen).seconds > self._heartbeat_interval * 3
+            ]
+            for node_id in dead_nodes:
+                del self.peers[node_id]
+            await asyncio.sleep(self._heartbeat_interval)
+
+    def get_active_peers(self) -> Set[str]:
+        return {p.node_id for p in self.peers.values() if p.status == 'active'}
+
+    async def broadcast_message(self, message: dict):
+        for peer in list(self.peers.values()):
+            if peer.status == 'active':
+                try:
+                    reader, writer = await asyncio.open_connection(
+                        peer.address, peer.port
+                    )
+                    writer.write(json.dumps(message).encode())
+                    await writer.drain()
+                    writer.close()
+                    await writer.wait_closed()
+                except:
+                    peer.status = 'unreachable'
